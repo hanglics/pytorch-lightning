@@ -1,5 +1,9 @@
 """
 Sync-bn with DDP (GPU)
+
+This code is to verify that batch statistics are synchronized across GPUs using sync-bn.
+When sync_bn_backend is set to 'torch' or 'apex', the training loop should run for 3 iterations.
+When sync_bn_backend is set to None, the code should result in an AssertionError.
 """
 import os
 import math
@@ -78,6 +82,7 @@ class SyncBNModule(pl.LightningModule):
             out_bn = self.bn_layer(x.view(x.size(0), -1))
 
             if self.bn_targets:
+                bn_target = self.bn_targets[batch_idx]
                 print('#######')
                 print(self.trainer.local_rank)
                 print(out_bn.shape)
