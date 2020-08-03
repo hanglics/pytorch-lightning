@@ -33,7 +33,7 @@ class MNISTDataModule(pl.LightningDataModule):
 
         # self.dims is returned when you call dm.size()
         # Setting default dims here because we know them.
-        # Could optionally be assigned dynamically in dm.setup() 
+        # Could optionally be assigned dynamically in dm.setup()
         self.dims = (1, 28, 28)
 
     def prepare_data(self):
@@ -65,7 +65,7 @@ class MNISTDataModule(pl.LightningDataModule):
 class SyncBNModule(pl.LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
-        
+
         self.bn_targets = None
         if 'bn_targets' in kwargs:
             self.bn_targets = kwargs['bn_targets']
@@ -76,7 +76,7 @@ class SyncBNModule(pl.LightningModule):
     def forward(self, x, batch_idx):
         with torch.no_grad():
             out_bn = self.bn_layer(x.view(x.size(0), -1))
-            
+
             if self.bn_targets:
                 print('#######')
                 print(self.trainer.local_rank)
@@ -105,15 +105,15 @@ class SyncBNModule(pl.LightningModule):
         Define parameters that only apply to this model
         """
         parser = ArgumentParser(parents=[parent_parser])
-        
+
         parser.add_argument('--nodes', default=1, type=int)
         parser.add_argument('--gpu', default=2, type=int)
-        
+
         parser.add_argument('--epochs', default=1, type=int)
         parser.add_argument('--steps', default=3, type=int)
-        
+
         parser.add_argument('--sync_bn', default='torch', type=str)
-        
+
         return parser
 
 
@@ -156,7 +156,7 @@ def run_cli():
     model = SyncBNModule()
 
     bn_outputs = []
-    
+
     # shuffle is false by default
     for idx, batch in enumerate(train_dataloader):
         x, y = batch
