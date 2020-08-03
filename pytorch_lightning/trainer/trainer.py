@@ -184,6 +184,7 @@ class Trainer(
         log_save_interval: int = 100,
         row_log_interval: int = 50,
         distributed_backend: Optional[str] = None,
+        sync_bn_backend: str = 'torch',
         precision: int = 32,
         weights_summary: Optional[str] = ModelSummary.MODE_DEFAULT,
         weights_save_path: Optional[str] = None,
@@ -294,6 +295,8 @@ class Trainer(
             row_log_interval: How often to add logging rows (does not write to disk)
 
             distributed_backend: The distributed backend to use (dp, ddp, ddp2, ddp_spawn, ddp_cpu)
+
+            sync_bn_backend: Backend used for sync batchnorm.
 
             precision: Full precision (32), half precision (16).
 
