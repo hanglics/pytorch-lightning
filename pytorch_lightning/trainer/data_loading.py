@@ -1,30 +1,38 @@
+# Copyright The PyTorch Lightning team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import multiprocessing
 import platform
 from abc import ABC, abstractmethod
-from distutils.version import LooseVersion
 from typing import Union, List, Tuple, Callable, Optional
 
-import torch
 import torch.distributed as torch_distrib
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from pytorch_lightning.core import LightningModule
 from pytorch_lightning.utilities import rank_zero_warn
+from pytorch_lightning.utilities.data import has_iterable_dataset, has_len
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
+from pytorch_lightning.utilities.debugging import InternalDebugger
+from pytorch_lightning.utilities.model_utils import is_overridden
 
-try:
-    from torch.utils.data import IterableDataset
-    ITERABLE_DATASET_EXISTS = True
-except ImportError:
-    ITERABLE_DATASET_EXISTS = False
 
 try:
     from apex import amp
 except ImportError:
-    APEX_AVAILABLE = False
-else:
-    APEX_AVAILABLE = True
+    amp = None
 
 try:
     import torch_xla
@@ -41,35 +49,6 @@ except (ModuleNotFoundError, ImportError):
     HOROVOD_AVAILABLE = False
 else:
     HOROVOD_AVAILABLE = True
-
-
-def _has_iterable_dataset(dataloader: DataLoader):
-    return ITERABLE_DATASET_EXISTS and hasattr(dataloader, 'dataset') \
-        and isinstance(dataloader.dataset, IterableDataset)
-
-
-def _has_len(dataloader: DataLoader) -> bool:
-    """ Checks if a given Dataloader has __len__ method implemented i.e. if
-    it is a finite dataloader or infinite dataloader. """
-
-    try:
-        # try getting the length
-        if len(dataloader) == 0:
-            raise ValueError('`Dataloader` returned 0 length.'
-                             ' Please make sure that your Dataloader at least returns 1 batch')
-        has_len = True
-    except TypeError:
-        has_len = False
-    except NotImplementedError:  # e.g. raised by torchtext if a batch_size_fn is used
-        has_len = False
-
-    if has_len and _has_iterable_dataset(dataloader) and LooseVersion(torch.__version__) >= LooseVersion("1.4.0"):
-        rank_zero_warn(
-            'Your `IterableDataset` has `__len__` defined.'
-            ' In combination with multi-processing data loading (e.g. batch size > 1),'
-            ' this can lead to unintended side effects since the samples will be duplicated.'
-        )
-    return has_len
 
 
 class TrainerDataLoadingMixin(ABC):
@@ -98,25 +77,7 @@ class TrainerDataLoadingMixin(ABC):
     num_nodes: int
     num_processes: int
     distributed_backend: Optional[str]
-
-    @abstractmethod
-    def is_overridden(self, *args):
-        """Warning: this is just empty shell for code implemented in other class."""
-
-    def _check_batch_limits(self, name: str) -> None:
-        # TODO: verify it is still needed and deprecate it..
-        value = getattr(self, name)
-
-        # ints are fine
-        if isinstance(value, int):
-            return
-
-        msg = f'`{name}` must lie in the range [0.0, 1.0], but got {value:.3f}. (or pass in an int)'
-        if name == 'val_check_interval':
-            msg += ' If you want to disable validation set `limit_val_batches` to 0.0 instead.'
-
-        if not 0. <= value <= 1.:
-            raise ValueError(msg)
+    dev_debugger: InternalDebugger
 
     def _worker_check(self, dataloader: DataLoader, name: str) -> None:
         on_windows = platform.system() == 'Windows'
@@ -148,7 +109,7 @@ class TrainerDataLoadingMixin(ABC):
         # don't do anything if it's not a dataloader
         is_dataloader = isinstance(dataloader, DataLoader)
         # don't manipulate iterable datasets
-        is_iterable_ds = _has_iterable_dataset(dataloader)
+        is_iterable_ds = has_iterable_dataset(dataloader)
 
         if not is_dataloader or is_iterable_ds:
             return dataloader
@@ -207,23 +168,26 @@ class TrainerDataLoadingMixin(ABC):
         """
         self.train_dataloader = self.request_dataloader(model.train_dataloader)
 
+        # debugging
+        self.dev_debugger.track_load_dataloader_call('train_dataloader', dataloaders=[self.train_dataloader])
+
         self.num_training_batches = 0
 
         # automatically add samplers
         self.train_dataloader = self.auto_add_sampler(self.train_dataloader, train=True)
 
+        self.num_training_batches = len(self.train_dataloader) if has_len(self.train_dataloader) else float('inf')
         self._worker_check(self.train_dataloader, 'train dataloader')
-        self._check_batch_limits('limit_train_batches')
 
-        if not _has_len(self.train_dataloader):
-            self.num_training_batches = float('inf')
-        else:
-            # try getting the length
-            if isinstance(self.limit_train_batches, float):
-                self.num_training_batches = len(self.train_dataloader)
-                self.num_training_batches = int(self.num_training_batches * self.limit_train_batches)
-            else:
-                self.num_training_batches = min(len(self.train_dataloader), self.limit_train_batches)
+        if isinstance(self.limit_train_batches, int) or self.limit_train_batches == 0.0:
+            self.num_training_batches = min(self.num_training_batches, int(self.limit_train_batches))
+        elif self.num_training_batches != float('inf'):
+            self.num_training_batches = int(self.num_training_batches * self.limit_train_batches)
+        elif self.limit_train_batches != 1.0:
+            raise MisconfigurationException(
+                'When using an IterableDataset for `limit_train_batches`,'
+                ' `Trainer(limit_train_batches)` must be `0.0`, `1.0` or an int. An int k specifies'
+                ' `num_training_batches` to use.')
 
         # determine when to check validation
         # if int passed in, val checks that often
@@ -236,18 +200,15 @@ class TrainerDataLoadingMixin(ABC):
                     f'to the number of the training batches ({self.num_training_batches}). '
                     'If you want to disable validation set `limit_val_batches` to 0.0 instead.')
         else:
-            if not _has_len(self.train_dataloader):
+            if not has_len(self.train_dataloader):
                 if self.val_check_interval == 1.0:
                     self.val_check_batch = float('inf')
                 else:
                     raise MisconfigurationException(
-                        'When using an infinite DataLoader (e.g. with an IterableDataset'
-                        ' or when DataLoader does not implement `__len__`) for `train_dataloader`,'
+                        'When using an IterableDataset for `train_dataloader`,'
                         ' `Trainer(val_check_interval)` must be `1.0` or an int. An int k specifies'
                         ' checking validation every k training batches.')
             else:
-                self._check_batch_limits('val_check_interval')
-
                 self.val_check_batch = int(self.num_training_batches * self.val_check_interval)
                 self.val_check_batch = max(1, self.val_check_batch)
 
@@ -266,13 +227,17 @@ class TrainerDataLoadingMixin(ABC):
             Tuple (num_batches, dataloaders)
         """
         # use the training loader as val and test when overfitting
+        loader_name = f'{mode}_dataloader'
         if self.overfit_batches > 0:
-            dataloaders = self.request_dataloader(getattr(model, 'train_dataloader'))
-        else:
-            dataloaders = self.request_dataloader(getattr(model, f'{mode}_dataloader'))
+            loader_name = 'train_dataloader'
+
+        # load loaders
+        dataloaders = self.request_dataloader(getattr(model, loader_name))
 
         if not isinstance(dataloaders, list):
             dataloaders = [dataloaders]
+
+        self.dev_debugger.track_load_dataloader_call(loader_name, dataloaders=dataloaders)
 
         for loader_i in range(len(dataloaders)):
             loader = dataloaders[loader_i]
@@ -302,26 +267,22 @@ class TrainerDataLoadingMixin(ABC):
         # datasets could be none, 1 or 2+
         if len(dataloaders) != 0:
             for i, dataloader in enumerate(dataloaders):
-                num_batches = len(dataloader) if _has_len(dataloader) else float('inf')
+                num_batches = len(dataloader) if has_len(dataloader) else float('inf')
                 self._worker_check(dataloader, f'{mode} dataloader {i}')
 
                 # percent or num_steps
                 limit_eval_batches = getattr(self, f'limit_{mode}_batches')
 
-                if num_batches != float('inf'):
-                    self._check_batch_limits(f'limit_{mode}_batches')
-
-                    # limit num batches either as a percent or num steps
-                    if isinstance(limit_eval_batches, float):
-                        num_batches = int(num_batches * limit_eval_batches)
-                    else:
-                        num_batches = min(len(dataloader), limit_eval_batches)
-
-                elif limit_eval_batches not in (0.0, 1.0):
+                # limit num batches either as a percent or num steps
+                if isinstance(limit_eval_batches, int) or limit_eval_batches == 0.0:
+                    num_batches = min(num_batches, int(limit_eval_batches))
+                elif num_batches != float('inf'):
+                    num_batches = int(num_batches * limit_eval_batches)
+                elif limit_eval_batches != 1.0:
                     raise MisconfigurationException(
-                        'When using an infinite DataLoader (e.g. with an IterableDataset'
-                        f' or when DataLoader does not implement `__len__`) for `limit_{mode}_batches`,'
-                        f' `Trainer(limit_{mode}_batches)` must be `0.0` or `1.0`.')
+                        'When using an IterableDataset for `limit_{mode}_batches`,'
+                        f' `Trainer(limit_{mode}_batches)` must be `0.0`, `1.0` or an int. An int k specifies'
+                        f' `num_{mode}_batches` to use.')
 
                 if num_batches == 0 and limit_eval_batches > 0.0 and isinstance(limit_eval_batches, float):
                     min_pct = 1.0 / len(dataloader)
@@ -341,8 +302,8 @@ class TrainerDataLoadingMixin(ABC):
         Args:
             model: The current `LightningModule`
         """
-        has_loader = self.is_overridden('val_dataloader', model)
-        has_step = self.is_overridden('validation_step', model)
+        has_loader = is_overridden('val_dataloader', model)
+        has_step = is_overridden('validation_step', model)
         if has_loader and has_step:
             self.num_val_batches, self.val_dataloaders = self._reset_eval_dataloader(model, 'val')
 
@@ -352,8 +313,8 @@ class TrainerDataLoadingMixin(ABC):
         Args:
             model: The current `LightningModule`
         """
-        has_loader = self.is_overridden('test_dataloader', model)
-        has_step = self.is_overridden('test_step', model)
+        has_loader = is_overridden('test_dataloader', model)
+        has_step = is_overridden('test_step', model)
         if has_loader and has_step:
             self.num_test_batches, self.test_dataloaders =\
                 self._reset_eval_dataloader(model, 'test')
@@ -388,9 +349,6 @@ class TrainerDataLoadingMixin(ABC):
     def determine_data_use_amount(self, overfit_batches: float) -> None:
         """Use less data for debugging purposes"""
         if overfit_batches > 0:
-            if isinstance(overfit_batches, float) and overfit_batches > 1:
-                raise ValueError('`overfit_batches` when used as a percentage must'
-                                 f' be in range 0.0 < x < 1.0 but got {overfit_batches:.3f}.')
             self.limit_train_batches = overfit_batches
             self.limit_val_batches = overfit_batches
             self.limit_test_batches = overfit_batches

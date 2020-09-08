@@ -1,3 +1,4 @@
+from copy import deepcopy
 import pytest
 import torch
 
@@ -33,7 +34,7 @@ def test_model_reset_correctly(tmpdir):
         max_epochs=1,
     )
 
-    before_state_dict = model.state_dict()
+    before_state_dict = deepcopy(model.state_dict())
 
     _ = trainer.lr_find(model, num_training=5)
 
@@ -73,11 +74,15 @@ def test_trainer_reset_correctly(tmpdir):
             f'Attribute {key} was not reset correctly after learning rate finder'
 
 
-def test_trainer_arg_bool(tmpdir):
+@pytest.mark.parametrize('use_hparams', [False, True])
+def test_trainer_arg_bool(tmpdir, use_hparams):
     """ Test that setting trainer arg to bool works """
     hparams = EvalModelTemplate.get_default_hparams()
     model = EvalModelTemplate(**hparams)
     before_lr = hparams.get('learning_rate')
+    if use_hparams:
+        del model.learning_rate
+        model.configure_optimizers = model.configure_optimizers__lr_from_hparams
 
     # logger file to get meta
     trainer = Trainer(
@@ -86,18 +91,28 @@ def test_trainer_arg_bool(tmpdir):
         auto_lr_find=True,
     )
 
-    trainer.fit(model)
-    after_lr = model.learning_rate
+    trainer.tune(model)
+    if use_hparams:
+        after_lr = model.hparams.learning_rate
+    else:
+        after_lr = model.learning_rate
+
     assert before_lr != after_lr, \
         'Learning rate was not altered after running learning rate finder'
 
 
-def test_trainer_arg_str(tmpdir):
+@pytest.mark.parametrize('use_hparams', [False, True])
+def test_trainer_arg_str(tmpdir, use_hparams):
     """ Test that setting trainer arg to string works """
-    model = EvalModelTemplate()
+    hparams = EvalModelTemplate.get_default_hparams()
+    model = EvalModelTemplate(**hparams)
     model.my_fancy_lr = 1.0  # update with non-standard field
-
+    model.hparams['my_fancy_lr'] = 1.0
     before_lr = model.my_fancy_lr
+    if use_hparams:
+        del model.my_fancy_lr
+        model.configure_optimizers = model.configure_optimizers__lr_from_hparams
+
     # logger file to get meta
     trainer = Trainer(
         default_root_dir=tmpdir,
@@ -105,8 +120,12 @@ def test_trainer_arg_str(tmpdir):
         auto_lr_find='my_fancy_lr',
     )
 
-    trainer.fit(model)
-    after_lr = model.my_fancy_lr
+    trainer.tune(model)
+    if use_hparams:
+        after_lr = model.hparams.my_fancy_lr
+    else:
+        after_lr = model.my_fancy_lr
+
     assert before_lr != after_lr, \
         'Learning rate was not altered after running learning rate finder'
 
@@ -127,7 +146,7 @@ def test_call_to_trainer_method(tmpdir):
     lrfinder = trainer.lr_find(model, mode='linear')
     after_lr = lrfinder.suggestion()
     model.learning_rate = after_lr
-    trainer.fit(model)
+    trainer.tune(model)
 
     assert before_lr != after_lr, \
         'Learning rate was not altered after running learning rate finder'

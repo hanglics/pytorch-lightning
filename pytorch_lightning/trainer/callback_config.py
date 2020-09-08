@@ -1,11 +1,25 @@
-import os
-from abc import ABC, abstractmethod
-from typing import List, Callable, Optional
+# Copyright The PyTorch Lightning team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+from abc import ABC, abstractmethod
+from typing import List, Optional
 
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping, ProgressBarBase, ProgressBar
 from pytorch_lightning.loggers import LightningLoggerBase
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
+from pytorch_lightning.utilities.model_utils import is_overridden
+from pytorch_lightning.core.lightning import LightningModule
 
 
 class TrainerCallbackConfigMixin(ABC):
@@ -29,13 +43,13 @@ class TrainerCallbackConfigMixin(ABC):
         """Warning: this is just empty shell for code implemented in other class."""
 
     @abstractmethod
-    def is_overridden(self, *args):
+    def get_model(self) -> LightningModule:
         """Warning: this is just empty shell for code implemented in other class."""
 
     def configure_checkpoint_callback(self, checkpoint_callback):
         if checkpoint_callback is True:
             # when no val step is defined, use 'loss' otherwise 'val_loss'
-            train_step_only = not self.is_overridden('validation_step')
+            train_step_only = not is_overridden('validation_step', self.get_model())
             monitor_key = 'loss' if train_step_only else 'val_loss'
             checkpoint_callback = ModelCheckpoint(
                 filepath=None,

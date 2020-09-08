@@ -33,17 +33,14 @@ from pytorch_lightning.overrides.data_parallel import (
     LightningDistributedDataParallel,
     LightningDataParallel,
 )
-from pytorch_lightning.utilities import move_data_to_device, NATIVE_AMP_AVALAIBLE
+from pytorch_lightning.utilities import move_data_to_device, AMPType
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities.distributed import rank_zero_only
-from pytorch_lightning.utilities import rank_zero_warn
 
 try:
     from apex import amp
 except ImportError:
-    APEX_AVAILABLE = False
-else:
-    APEX_AVAILABLE = True
+    amp = None
 
 try:
     import torch_xla.core.xla_model as xm
@@ -74,6 +71,7 @@ class TrainerDPMixin(ABC):
     amp_level: str
     precision: ...
     global_rank: int
+    local_rank: int
     tpu_local_core_rank: int
     tpu_global_core_rank: int
     use_tpu: bool
@@ -82,18 +80,10 @@ class TrainerDPMixin(ABC):
     on_colab_kaggle: str
     save_spawn_weights: Callable
     logger: ...
-
-    @property
-    @abstractmethod
-    def use_amp(self) -> bool:
-        """Warning: this is just empty shell for code implemented in other class."""
+    amp_backend: AMPType
 
     @abstractmethod
     def call_setup_hook(self, *args):
-        """Warning: this is just empty shell for code implemented in other class."""
-
-    @abstractmethod
-    def run_pretrain_routine(self, *args):
         """Warning: this is just empty shell for code implemented in other class."""
 
     @abstractmethod
@@ -130,34 +120,15 @@ class TrainerDPMixin(ABC):
             m.use_dp = self.use_dp
             m.use_ddp2 = self.use_ddp2
             m.use_ddp = self.use_ddp
-            m.use_amp = self.use_amp
+            m.use_amp = self.amp_backend is not None
             m.testing = self.testing
             m.use_single_gpu = self.use_single_gpu
             m.use_tpu = self.use_tpu
             m.tpu_local_core_rank = self.tpu_local_core_rank
             m.tpu_global_core_rank = self.tpu_global_core_rank
-
-    def transfer_batch_to_tpu(self, batch: Any, tpu_id: Optional[int] = None):
-        """
-        Transfers the data to the TPU.
-
-        Args:
-            batch: A tensor or collection of tensors.
-            tpu_id: The id of the TPU core. If omitted, the first available core is chosen.
-
-        Return:
-            the tensor on the TPU device.
-
-        See Also:
-            - :func:`~pytorch_lightning.utilities.apply_func.move_data_to_device`
-        """
-        if not XLA_AVAILABLE:
-            raise MisconfigurationException(
-                'Requested to transfer batch to TPU but XLA is not available.'
-                ' Are you sure this machine has TPUs?'
-            )
-        device = xm.xla_device(tpu_id)
-        return self.__transfer_batch_to_device(batch, device)
+            m.precision = self.precision
+            m.global_rank = self.global_rank
+            m.local_rank = self.local_rank
 
     def transfer_batch_to_gpu(self, batch: Any, gpu_id: Optional[int] = None):
         """
@@ -181,72 +152,6 @@ class TrainerDPMixin(ABC):
         if model is not None:
             return model.transfer_batch_to_device(batch, device)
         return move_data_to_device(batch, device)
-
-    def horovod_train(self, model):
-        # call setup after the ddp process has connected
-        self.call_setup_hook(model)
-
-        if torch.cuda.is_available() and self.on_gpu:
-            # Horovod: pin GPU to local rank
-            assert self.root_gpu == hvd.local_rank()
-            torch.cuda.set_device(self.root_gpu)
-            model.cuda(self.root_gpu)
-
-        # avoid duplicating progress bar
-        if hvd.rank() != 0 and self.progress_bar_callback is not None:
-            self.progress_bar_callback.disable()
-
-        # CHOOSE OPTIMIZER
-        # allow for lr schedulers as well
-        self.optimizers, self.lr_schedulers, self.optimizer_frequencies = self.init_optimizers(model)
-
-        # Horovod: scale the learning rate by the number of workers to account for
-        # increased total batch size
-        for optimizer in self.optimizers:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] *= hvd.size()
-
-        # Horovod: adjust base LR used by schedulers to match scaled optimizer initial LR
-        for scheduler in self.lr_schedulers:
-            scheduler = scheduler['scheduler']
-            if isinstance(scheduler, _LRScheduler):
-                scheduler.base_lrs = [lr * hvd.size() for lr in scheduler.base_lrs]
-
-        if self.use_amp:
-            model, optimizers = model.configure_apex(amp, model, self.optimizers, self.amp_level)
-            self.optimizers = optimizers
-            self.reinit_scheduler_properties(self.optimizers, self.lr_schedulers)
-
-        # Horovod: broadcast parameters & optimizer state to ensure consistent initialization
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-        for optimizer in self.optimizers:
-            hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
-        def filter_named_parameters(model, optimizer):
-            opt_params = set([p for group in optimizer.param_groups for p in group.get('params', [])])
-            return [(name, p) for name, p in model.named_parameters() if p in opt_params]
-
-        # Horovod: wrap optimizers to perform gradient aggregation via allreduce
-        self.optimizers = [
-            hvd.DistributedOptimizer(optimizer, named_parameters=filter_named_parameters(model, optimizer))
-            for optimizer in self.optimizers
-        ]
-
-        # Update logger rank info from Horovod to avoid race conditions from  different ranks
-        # creating directories / writing files in the same locations.
-        self.global_rank = hvd.rank()
-        rank_zero_only.rank = self.global_rank
-
-        with ExitStack() as stack:
-            for optimizer in self.optimizers:
-                # Synchronization will be performed explicitly following backward()
-                stack.enter_context(optimizer.skip_synchronize())
-
-            result = self.run_pretrain_routine(model)
-
-        # Make sure all workers have finished training before returning to the user
-        hvd.join()
-        return result
 
 
 def _normalize_parse_gpu_string_input(s: Union[int, str, List[int]]) -> Union[int, List[int]]:
